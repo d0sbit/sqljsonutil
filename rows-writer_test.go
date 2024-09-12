@@ -1,11 +1,15 @@
 package sqljsonutil
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http/httptest"
 	"net/http/httputil"
 	"os"
+	"strings"
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -39,6 +43,19 @@ func mustDbSetup(t *testing.T) *sql.DB {
 		t.Fatal(err)
 	}
 	_, err = db.Exec("INSERT INTO widgets (widget_id,name) VALUES ('abc123','First One'), ('def456', 'Next One')")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.Exec("CREATE TABLE IF NOT EXISTS widgets_data (widget_id VARCHAR(64), data MEDIUMTEXT)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec("DELETE FROM widgets_data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec("INSERT INTO widgets_data (widget_id,data) VALUES ('abc123','{\"description\":\"This is abc123, the first one.\"}'), ('def456', '{\"description\":\"This is def456, the next one.\"}')")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,5 +169,97 @@ func TestWrite(t *testing.T) {
 		}
 		t.Logf("RESPONSE: %s", resText)
 
+	})
+
+	t.Run("CustomJSONOutput", func(t *testing.T) {
+
+		rows, err := db.Query("SELECT * FROM widgets_data")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+
+		rec := httptest.NewRecorder()
+
+		rw := NewRowsWriter(rec, rows)
+		rw.JSONValueFunc = func(w io.Writer, colName string, colIndex int, value interface{}) (ok, skip bool, err error) {
+			if colName == "data" {
+				var buf bytes.Buffer
+				buf.WriteString("null")
+				switch v := value.(type) {
+				case *sql.NullString:
+					if v.Valid && json.Valid([]byte(v.String)) { // compiler should optimize this cast away in Go 1.22+
+						buf.Reset()
+						buf.WriteString(v.String)
+					}
+				default:
+					return false, false, fmt.Errorf("unknown 'data' column type: %#T", value)
+				}
+				w.Write(buf.Bytes())
+				return true, false, nil
+			}
+			return
+		}
+
+		err = rw.WriteResponse()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		res := rec.Result()
+
+		resText, err := httputil.DumpResponse(res, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("RESPONSE: %s", resText)
+	})
+
+	t.Run("SkippingFields", func(t *testing.T) {
+
+		rows, err := db.Query("SELECT * FROM widgets_data")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+
+		rec := httptest.NewRecorder()
+
+		rw := NewRowsWriter(rec, rows)
+		rw.JSONValueFunc = func(w io.Writer, colName string, colIndex int, value interface{}) (ok, skip bool, err error) {
+			if colName == "data" {
+				var buf bytes.Buffer
+				buf.WriteString("null")
+				switch v := value.(type) {
+				case *sql.NullString:
+					// only output data field values that contain the word "first"
+					if v.Valid && strings.Contains(v.String, "first") && json.Valid([]byte(v.String)) { // compiler should optimize this cast away in Go 1.22+
+						buf.Reset()
+						buf.WriteString(v.String)
+						break
+					}
+					skip = true
+					return
+				default:
+					return false, false, fmt.Errorf("unknown 'data' column type: %#T", value)
+				}
+				w.Write(buf.Bytes())
+				return true, false, nil
+			}
+			return
+		}
+
+		err = rw.WriteResponse()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		res := rec.Result()
+
+		resText, err := httputil.DumpResponse(res, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("RESPONSE: %s", resText)
 	})
 }

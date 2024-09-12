@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"reflect"
 	"strconv"
-	"strings"
 	"time"
 	"unsafe"
 )
@@ -20,8 +19,24 @@ import (
 // RowsWriter takes care of writing a sql.Rows to a stream as JSON using the same field
 // names that came from the SQL result set.
 type RowsWriter struct {
-	Writer io.Writer
-	Rows   *sql.Rows
+	Writer io.Writer // write output here
+	Rows   *sql.Rows // SQL result rows to read from
+
+	// JSONValueFunc, if not nil, gives you the ability to convert individual
+	// fields to JSON using custom logic.
+	//
+	// w is where to write the value, colName is the column name, colIndex is the column index,
+	// and value is the data that resulted from scanning the rows.
+	//
+	// Only valid JSON should be written to w.
+	//
+	// If this function returns ok==true, it means w was written to, otherwise ok==false tells
+	// the calling code to use the default value writing behavior.
+	//
+	// If skip==true it means the field should be skipped entirely (it's field name not written).
+	//
+	// If a non-nil err is returned then this will be returned to the top level calling code.
+	JSONValueFunc func(w io.Writer, colName string, colIndex int, value interface{}) (ok, skip bool, err error)
 
 	colNames          []string
 	scanArgs          []interface{}
@@ -124,7 +139,7 @@ func (rw *RowsWriter) writeRawJSONValue(v interface{}) error {
 
 	}
 
-	panic(fmt.Errorf("unknown type for writeRawJSONValue %T: %#v", v, v))
+	return (fmt.Errorf("unknown type for writeRawJSONValue %T: %#v", v, v))
 
 }
 
@@ -500,33 +515,59 @@ func (rw *RowsWriter) WriteCommaRows() error {
 // writeRowFields will write the object fields to rowOutBuf without flushing it
 func (rw *RowsWriter) writeRowFields() error {
 
+	var customJSONBuf bytes.Buffer
+	customJSONBufOk := false
+
 	// output each column as JSON object entry, fast paths for specific cases
 	doneFirstCol := false
 colloop:
 	for i := range rw.colNames {
+
+		thisColName := rw.colNames[i]
+		thisScanArg := rw.scanArgs[i]
+
+		// handle the JSONValueFunc case and buffer whatever is output here
+		customJSONBufOk = false
+		if rw.JSONValueFunc != nil {
+			customJSONBuf.Reset()
+			ok, skip, err := rw.JSONValueFunc(&customJSONBuf, thisColName, i, thisScanArg)
+			if err != nil {
+				return err
+			}
+			if skip {
+				continue
+			}
+			customJSONBufOk = ok
+		}
 
 		if doneFirstCol {
 			rw.rowOutBuf.WriteByte(',')
 		}
 		doneFirstCol = true
 
-		rw.writeValue(rw.colNames[i])
+		rw.writeValue(thisColName)
 		rw.rowOutBuf.WriteByte(':')
 
-		// json fields are output raw
-		if rw.jsonFieldSuffixes == nil && strings.HasSuffix(rw.colNames[i], "_json") {
-			rw.writeRawJSONValue(rw.scanArgs[i])
+		// if custom value from JSONValueFunc, write it here
+		if customJSONBufOk {
+			rw.rowOutBuf.Write(customJSONBuf.Bytes())
 			continue colloop
-		} else if rw.jsonFieldSuffixes != nil {
-			for _, suf := range rw.jsonFieldSuffixes {
-				if strings.HasSuffix(rw.colNames[i], suf) {
-					rw.writeRawJSONValue(rw.scanArgs[i])
-					continue colloop
-				}
-			}
 		}
+
+		// // json fields are output raw
+		// if rw.jsonFieldSuffixes == nil && strings.HasSuffix(thisColName, "_json") {
+		// 	rw.writeRawJSONValue(thisScanArg)
+		// 	continue colloop
+		// } else if rw.jsonFieldSuffixes != nil {
+		// 	for _, suf := range rw.jsonFieldSuffixes {
+		// 		if strings.HasSuffix(thisColName, suf) {
+		// 			rw.writeRawJSONValue(thisScanArg)
+		// 			continue colloop
+		// 		}
+		// 	}
+		// }
 		// otherwise use writeValue
-		rw.writeValue(rw.scanArgs[i])
+		rw.writeValue(thisScanArg)
 
 		// if strings.HasSuffix(rw.colNames[i], "_json") {
 		// 	rw.writeRawJSONValue(rw.scanArgs[i])
@@ -564,14 +605,18 @@ func (rw *RowsWriter) scanRowArgs(comma bool) error {
 
 			//log.Printf("coltype: %v scanArg: %v", ct, scanArgs[i])
 
-			// HACK: so this is unfortunate but the MySQL driver does not send back "UNSIGNED" for unsigned ints.
+			// FIXME: this stuff is a bit of a leftover mess - we really should add in a way to customize
+			// the scanning type layer, allowing people to at least work around the oddities they might encouter.
+			// I just ran out of time while I was last working on this. -bgp
+
+			// EARLIER HACK: so this is unfortunate but the MySQL driver does not send back "UNSIGNED" for unsigned ints.
 			// This is a problem for specific fields that use the full range of a uint64. Thus we just
 			// hack it by name.
 
 			switch colNames[i] {
-			case "asin_hash", "sku_hash", "created_at": //, "change_time":
-				// use strings, since uint64 is not representable in JSON
-				scanArgs[i] = new(string)
+			// case "asin_hash", "sku_hash", "created_at": //, "change_time":
+			// 	// use strings, since uint64 is not representable in JSON
+			// 	scanArgs[i] = new(string)
 			// case "change_time":
 			// 	scanArgs[i] = new(Timestamp)
 			default:
@@ -586,18 +631,21 @@ func (rw *RowsWriter) scanRowArgs(comma bool) error {
 				// 2023/06/08 15:43:59 coltype: &{change_time true false true false 0 TIMESTAMP 0 0 0x17dc000} scanArg: <nil>
 				//scanType: sql.NullTime
 
-				if (ct.DatabaseTypeName() == "TIMESTAMP") && scanType.String() == "sql.NullTime" {
-					scanArgs[i] = new(string)
-				} else if strings.HasSuffix(colNames[i], "_id") || ((ct.DatabaseTypeName() == "DATETIME") && scanType.String() == "sql.NullTime") {
-					// anything that ends with "_id" we assume is a uint64 that needs to be made a string
-					scanArgs[i] = new(sql.NullString)
-					// } else if scanType.ConvertibleTo(reflect.TypeOf(sql.NullTime{})) {
-					// use *sql.NullTime, since the mysql driver is returning a *mysql.NullTime - so lame
-					// scanArgs[i] = &sql.NullTime{}
-				} else {
-					// allocate and get pointer using whatever the database has
-					scanArgs[i] = reflect.New(scanType).Interface()
-				}
+				// NOTE: THESE ARE ACTUALLY IMPORTANT, I JUST DIDN'T WANT TO HACK IN MYSQL-SPECIFIC STUFF FROM THE START HERE, BUT INSTEAD
+				// FOCUS ON LETTING PEOPLE CUSTOMIZE THINGS, BUT THIS LOGIC SHOULD GO SOME PLACE PERHAPS SOME MYSQL-SPECIFIC CONVERSION
+				// FUNCTION THAT PEOPLE CAN PLUG IN. -bgp
+				// if (ct.DatabaseTypeName() == "TIMESTAMP") && scanType.String() == "sql.NullTime" {
+				// 	scanArgs[i] = new(string)
+				// } else if strings.HasSuffix(colNames[i], "_id") || ((ct.DatabaseTypeName() == "DATETIME") && scanType.String() == "sql.NullTime") {
+				// 	// anything that ends with "_id" we assume is a uint64 that needs to be made a string
+				// 	scanArgs[i] = new(sql.NullString)
+				// 	// } else if scanType.ConvertibleTo(reflect.TypeOf(sql.NullTime{})) {
+				// 	// use *sql.NullTime, since the mysql driver is returning a *mysql.NullTime - so lame
+				// 	// scanArgs[i] = &sql.NullTime{}
+				// } else {
+				// allocate and get pointer using whatever the database has
+				scanArgs[i] = reflect.New(scanType).Interface()
+				// }
 
 			}
 

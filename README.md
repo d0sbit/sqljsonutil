@@ -114,16 +114,16 @@ func (h *SomeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     fmt.Fprint(w, `[`)
     rw := sqljsonutil.NewRowsWriter(w, rows)
 
-	for rows.Next() {
-		err := rw.WriteCommaRow()
-		if err != nil {
-			return err
-		}
+    for rows.Next() {
+        err := rw.WriteCommaRow()
+        if err != nil {
+            return err
+        }
         // TODO: you can do more work here if needed
-	}
-	if err := rows.Err(); err != nil {
-		//...
-	}
+    }
+    if err := rows.Err(); err != nil {
+        //...
+    }
     fmt.Fprint(w, `]`)
 
 }
@@ -131,8 +131,107 @@ func (h *SomeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 ### Custom JSON Output
 
-TODO
+You can control how fields are converted to JSON by setting `JSONValueFunc`.  An example use case is to emit certain fields which contain JSON in them already as-is without string escaping:
+
+```go
+func (h *SomeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    
+    //...
+
+    rows, err := db.Query(...)
+    //...
+    defer rows.Close()
+    rw := sqljsonutil.NewRowsWriter(w, rows)
+    rw.JSONValueFunc = func(w io.Writer, colName string, colIndex int, value interface{}) (ok, skip bool, err error) {
+        if colName == "data" {
+            var buf bytes.Buffer
+            buf.WriteString("null")
+            switch v := value.(type) {
+            case *sql.NullString:
+                if v.Valid && json.Valid([]byte(v.String)) { // compiler should optimize this cast away in Go 1.22+
+                    buf.Reset()
+                    buf.WriteString(v.String)
+                }
+            default:
+                return false, false, fmt.Errorf("unknown 'data' column type: %#T", value)
+            }
+            w.Write(buf.Bytes())
+            return true, false, nil
+        }
+        return
+    }
+
+    err = rw.WriteResponse()
+    //...
+
+}
+```
+
+And then output has the values of the `data` field unescaped (e.g. the first data field in this case contained the string `{"description":"This is abc123, the first one."}`, which was output literally here instead of adding backslashes).
+
+```
+Content-Type: application/json
+
+[
+{"widget_id":"abc123","data":{"description":"This is abc123, the first one."}}
+,{"widget_id":"def456","data":{"description":"This is def456, the next one."}}
+]
+```
+
+
+### Skipping Fields
+
+You can also use `JSONValueFunc` to skip outputting fields you don't want based on custom logic.  This will only write out `data` fields as JSON if they contain the string `first`, and otherwise skip outputting the `data` field:
+
+```go
+func (h *SomeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    
+    //...
+
+    rows, err := db.Query(...)
+    //...
+    defer rows.Close()
+    rw := sqljsonutil.NewRowsWriter(w, rows)
+    rw.JSONValueFunc = func(w io.Writer, colName string, colIndex int, value interface{}) (ok, skip bool, err error) {
+        if colName == "data" {
+            var buf bytes.Buffer
+            buf.WriteString("null")
+            switch v := value.(type) {
+            case *sql.NullString:
+                // only output data field values that contain the word "first"
+                if v.Valid && strings.Contains(v.String, "first") && json.Valid([]byte(v.String)) { // compiler should optimize this cast away in Go 1.22+
+                    buf.Reset()
+                    buf.WriteString(v.String)
+                    break
+                }
+                skip = true
+                return
+            default:
+                return false, false, fmt.Errorf("unknown 'data' column type: %#T", value)
+            }
+            w.Write(buf.Bytes())
+            return true, false, nil
+        }
+        return
+    }
+
+    err = rw.WriteResponse()
+    //...
+
+}
+```
+
+Output:
+```
+Content-Type: application/json
+
+[
+{"widget_id":"abc123","data":{"description":"This is abc123, the first one."}}
+,{"widget_id":"def456"}
+]
+```
+
 
 ### Custom SQL Scanning
 
-TODO
+TODO: This still needs to be implemented.  Feel free to open an issue (or better yet, a pull request :) if you run into needing this.
