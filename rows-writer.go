@@ -18,10 +18,10 @@ import (
 // look for field-specific hacks and _json prefix and either remove or make them options on the writer
 
 // RowsWriter takes care of writing a sql.Rows to a stream as JSON using the same field
-// names that came from the SQL result set.  Each line is output as a JSON object {...} with
-// commas separating each field.  Output a [ before and ] after to make a valid JSON array.
+// names that came from the SQL result set.
 type RowsWriter struct {
 	Writer io.Writer
+	Rows   *sql.Rows
 
 	colNames          []string
 	scanArgs          []interface{}
@@ -33,8 +33,24 @@ type RowsWriter struct {
 }
 
 // NewRowsWriter is the same as: return &RowsWriter{Writer: w}
-func NewRowsWriter(w io.Writer) *RowsWriter {
-	return &RowsWriter{Writer: w}
+func NewRowsWriter(w io.Writer, rows *sql.Rows) *RowsWriter {
+	return &RowsWriter{Writer: w, Rows: rows}
+}
+
+// Reset clears the internal state for this RowsWriter.
+// The value of Writer is retained.  Other internal buffers
+// have the equivalent reset functionality applied (i.e. reusing memory where possible).
+// This must be called before using this RowsWriter with a different sql.Rows.
+func (rw *RowsWriter) Reset(rows *sql.Rows) {
+	rw.Rows = rows
+	rw.colNames = rw.colNames[:0]
+	rw.scanArgs = rw.scanArgs[:0]
+	rw.rowOutBuf.Reset()
+	rw.rowOutEnc = nil
+	rw.valOutBuf.Reset()
+	rw.valOutBytes = rw.valOutBytes[:0]
+	rw.jsonFieldSuffixes = rw.jsonFieldSuffixes[:0]
+
 }
 
 func stringNeedsJSONEsc(s string) bool {
@@ -356,14 +372,26 @@ func (rw *RowsWriter) writeValue(v interface{}) error {
 
 // WriteResponse writes rows as a full response of a JSON array and objects for each row.
 // It will iterate through rows until the end of the result set.
-func (rw *RowsWriter) WriteResponse(w http.ResponseWriter, rows *sql.Rows) error {
-	if w.Header().Get("Content-Type") == "" { // set content type the first time
-		w.Header().Set("Content-Type", "application/json")
+// Each line is output as a JSON object {...} with
+// commas separating each field.  Output a [ before and ] after to make a valid JSON array.
+// If the io.Writer in the Writer field is an http.ResponseWriter, then it will check
+// to see if the Content-Type header is empty and if so will set it to "application/json".
+func (rw *RowsWriter) WriteResponse() error {
+
+	rows := rw.Rows
+
+	if w, ok := rw.Writer.(http.ResponseWriter); ok {
+		if w.Header().Get("Content-Type") == "" { // set content type the first time
+			w.Header().Set("Content-Type", "application/json")
+		}
 	}
+
+	w := rw.Writer
+
 	fmt.Fprintln(w, "[")
 
 	for rows.Next() {
-		err := rw.WriteCommaRow(rows)
+		err := rw.WriteCommaRow()
 		if err != nil {
 			return err
 		}
@@ -403,9 +431,11 @@ func (rw *RowsWriter) WriteResponse(w http.ResponseWriter, rows *sql.Rows) error
 // Suitable for writing out multiple rows in an JSON array.
 // The same rows object must be passed each time, i.e. do not reuse an instance of this object for
 // multiple result sets.
-func (rw *RowsWriter) WriteCommaRow(rows *sql.Rows) error {
+func (rw *RowsWriter) WriteCommaRow() error {
 
-	err := rw.scanRowArgs(rows, true)
+	// rows := rw.Rows
+
+	err := rw.scanRowArgs(true)
 	if err != nil {
 		return err
 	}
@@ -426,9 +456,11 @@ func (rw *RowsWriter) WriteCommaRow(rows *sql.Rows) error {
 // WriteRow will call rows.Scan with the appropriate arguments and write the result as a JSON object.
 // The same rows object must be passed each time, i.e. do not reuse an instance of this object for
 // multiple result sets.
-func (rw *RowsWriter) WriteRow(rows *sql.Rows) error {
+func (rw *RowsWriter) WriteRow() error {
 
-	err := rw.scanRowArgs(rows, false)
+	// rows := rw.Rows
+
+	err := rw.scanRowArgs(false)
 	if err != nil {
 		return err
 	}
@@ -448,10 +480,12 @@ func (rw *RowsWriter) WriteRow(rows *sql.Rows) error {
 
 // WriteCommaRows calls WriteRow in a loop and adds a comma in between each.
 // Surround with `[`...`]` to form valid JSON.
-func (rw *RowsWriter) WriteCommaRows(rows *sql.Rows) error {
+func (rw *RowsWriter) WriteCommaRows() error {
+
+	rows := rw.Rows
 
 	for rows.Next() {
-		err := rw.WriteCommaRow(rows)
+		err := rw.WriteCommaRow()
 		if err != nil {
 			return err
 		}
@@ -506,7 +540,9 @@ colloop:
 	return nil
 }
 
-func (rw *RowsWriter) scanRowArgs(rows *sql.Rows, comma bool) error {
+func (rw *RowsWriter) scanRowArgs(comma bool) error {
+
+	rows := rw.Rows
 
 	// the first time we set up the stuff we need for scanning each row
 	if rw.colNames == nil {
@@ -614,40 +650,41 @@ func (rw *RowsWriter) scanRowArgs(rows *sql.Rows, comma bool) error {
 // 	return rw.rowMap, nil
 // }
 
-func (rw *RowsWriter) WriteFields(fieldNames ...string) error {
+// FIXME: this isn't quite ready yet - it's depending on scanArgs being set, doesn't mesh with the workflow
+// func (rw *RowsWriter) WriteFields(fieldNames ...string) error {
 
-	var err error
+// 	var err error
 
-	rw.rowOutBuf.Reset()
+// 	rw.rowOutBuf.Reset()
 
-	firstDone := false
-	for i, cn := range rw.colNames {
-		// log.Printf("col name: %#v", cn)
-		for _, fn := range fieldNames {
-			if cn == fn {
-				if firstDone {
-					rw.rowOutBuf.WriteByte(',')
-				}
-				firstDone = true
-				// log.Printf("WRITING VALUE: %#v", rw.scanArgs[i])
-				err = rw.writeValue(cn)
-				if err != nil {
-					return err
-				}
-				rw.rowOutBuf.WriteByte(':')
-				err = rw.writeValue(rw.scanArgs[i])
-				if err != nil {
-					return err
-				}
-				break
-			}
-		}
-	}
+// 	firstDone := false
+// 	for i, cn := range rw.colNames {
+// 		// log.Printf("col name: %#v", cn)
+// 		for _, fn := range fieldNames {
+// 			if cn == fn {
+// 				if firstDone {
+// 					rw.rowOutBuf.WriteByte(',')
+// 				}
+// 				firstDone = true
+// 				// log.Printf("WRITING VALUE: %#v", rw.scanArgs[i])
+// 				err = rw.writeValue(cn)
+// 				if err != nil {
+// 					return err
+// 				}
+// 				rw.rowOutBuf.WriteByte(':')
+// 				err = rw.writeValue(rw.scanArgs[i])
+// 				if err != nil {
+// 					return err
+// 				}
+// 				break
+// 			}
+// 		}
+// 	}
 
-	_, err = rw.rowOutBuf.WriteTo(rw.Writer)
-	return err
+// 	_, err = rw.rowOutBuf.WriteTo(rw.Writer)
+// 	return err
 
-}
+// }
 
 // unsafeString gives a string that points to the bytes of b.
 // Only use this temporarily in a controlled area, do not assign

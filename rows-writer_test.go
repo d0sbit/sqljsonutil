@@ -2,8 +2,10 @@ package sqljsonutil
 
 import (
 	"database/sql"
+	"fmt"
 	"net/http/httptest"
 	"net/http/httputil"
+	"os"
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -49,17 +51,33 @@ func TestWrite(t *testing.T) {
 	db := mustDbSetup(t)
 	defer db.Close()
 
-	rec := httptest.NewRecorder()
+	t.Run("WriterOutput", func(t *testing.T) {
 
-	rows, err := db.Query("SELECT * FROM widgets")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
+		rows, err := db.Query("SELECT * FROM widgets")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+
+		rw := NewRowsWriter(os.Stdout, rows)
+		err = rw.WriteCommaRows()
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
 
 	t.Run("WriteResponse", func(t *testing.T) {
-		rw := NewRowsWriter(rec)
-		err = rw.WriteResponse(rec, rows)
+
+		rows, err := db.Query("SELECT * FROM widgets")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+
+		rec := httptest.NewRecorder()
+
+		rw := NewRowsWriter(rec, rows)
+		err = rw.WriteResponse()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -73,4 +91,66 @@ func TestWrite(t *testing.T) {
 
 	})
 
+	t.Run("ResponsePrefixSuffix", func(t *testing.T) {
+
+		rows, err := db.Query("SELECT * FROM widgets")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+
+		rec := httptest.NewRecorder()
+
+		fmt.Fprint(rec, `{"result":`)
+
+		rw := NewRowsWriter(rec, rows)
+		err = rw.WriteResponse()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		fmt.Fprint(rec, `,"another_field":"here"}`)
+
+		res := rec.Result()
+		resText, err := httputil.DumpResponse(res, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("RESPONSE: %s", resText)
+
+	})
+
+	t.Run("Streaming", func(t *testing.T) {
+
+		rows, err := db.Query("SELECT * FROM widgets")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+
+		rec := httptest.NewRecorder()
+
+		fmt.Fprint(rec, `[`)
+
+		rw := NewRowsWriter(rec, rows)
+		for rows.Next() {
+			err := rw.WriteCommaRow()
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+
+		fmt.Fprint(rec, `]`)
+
+		res := rec.Result()
+		resText, err := httputil.DumpResponse(res, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("RESPONSE: %s", resText)
+
+	})
 }

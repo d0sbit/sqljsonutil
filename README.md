@@ -18,12 +18,14 @@ Here are some common use cases:
 
 ### Writer Output
 
+You can use any `io.Writer` implementation for output.
+
 ```go
 rows, err := db.Query(...)
 //...
 defer rows.Close()
-rw := sqljsonutil.NewRowsWriter(os.Stdout)
-rw.WriteCommaRows(rows)
+rw := sqljsonutil.NewRowsWriter(os.Stdout, rows)
+err = rw.WriteCommaRows()
 ```
 
 Output:
@@ -35,6 +37,8 @@ Output:
 
 ### HTTP Response
 
+Some additional utility is provided for sending HTTP responses:
+
 ```go
 func (h *SomeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     
@@ -43,7 +47,7 @@ func (h *SomeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     rows, err := db.Query(...)
     //...
     defer rows.Close()
-    err = sqljsonutil.NewRowsWriter(w).WriteResponse(w, rows)
+    err = sqljsonutil.NewRowsWriter(w, rows).WriteResponse()
 
     //...
 
@@ -62,9 +66,73 @@ Content-Type: application/json
 
 ### Response Prefix/Suffix
 
-### Filtering Fields
+You can also write a prefix and suffix to wrap the default HTTP as you like:
 
-### Embedded JSON
+```go
+func (h *SomeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    
+    //...
 
-### Custom Conversion Logic
+    rows, err := db.Query(...)
+    //...
+    defer rows.Close()
 
+    fmt.Fprint(w, `{"result":`)
+    err = sqljsonutil.NewRowsWriter(w, rows).WriteResponse()
+    //...
+    fmt.Fprint(w, `,"another_field":"here"}`)
+
+}
+```
+
+HTTP Response: (formatting added for clarity):
+```
+Content-Type: text/plain; charset=utf-8
+
+{
+    "result": [
+        {"widget_id":"abc123","name":"First One"},
+        {"widget_id":"def456","name":"Next One"}
+    ],
+    "another_field":"here"
+}
+```
+
+### Streaming
+
+You can use `WriteCommaRow` to write out each row separate and do work in between each record.  Note that this and other calls are designed to stream data one record at a time (unlike approaches that juse use json.Marshal on all rows at once, potentially using a lot of memory and delaying immediate output).
+
+```go
+func (h *SomeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    
+    //...
+
+    rows, err := db.Query(...)
+    //...
+    defer rows.Close()
+
+    fmt.Fprint(w, `[`)
+    rw := sqljsonutil.NewRowsWriter(w, rows)
+
+	for rows.Next() {
+		err := rw.WriteCommaRow()
+		if err != nil {
+			return err
+		}
+        // TODO: you can do more work here if needed
+	}
+	if err := rows.Err(); err != nil {
+		//...
+	}
+    fmt.Fprint(w, `]`)
+
+}
+```
+
+### Custom JSON Output
+
+TODO
+
+### Custom SQL Scanning
+
+TODO
